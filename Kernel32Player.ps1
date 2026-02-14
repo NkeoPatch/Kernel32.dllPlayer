@@ -26,7 +26,7 @@ public static class Kernel32PlayerBeep
     {
         Thread t = new Thread(() =>
         {
-            Beep(freq, 4294967294);  //
+            Beep(freq, 4294967294);
         });
         t.IsBackground = true;
         t.Start();
@@ -39,7 +39,7 @@ public static class Kernel32PlayerBeep
     {
         Thread t = new Thread(() =>
         {
-            Beep(1, 0);   // 37Hz, 0ms
+            Beep(1, 0);
         });
         t.IsBackground = true;
         t.Start();
@@ -52,6 +52,16 @@ public static class Kernel32PlayerBeep
     {
         Beep(freq, duration);
     }
+
+    /// <summary>
+    /// MIDI 播放用：在后台线程播放指定时长 Beep
+    /// </summary>
+    public static void PlayNote(uint freq, uint durationMs)
+    {
+        Thread t = new Thread(() => { Beep(freq, durationMs); });
+        t.IsBackground = true;
+        t.Start();
+    }
 }
 '@
 
@@ -63,6 +73,166 @@ try {
     if ($_.Exception.InnerException) {
         Write-Host $_.Exception.InnerException.Message -ForegroundColor Red
     }
+    return
+}
+
+# ============================
+# MIDI Parser (C# Add-Type)
+# ============================
+$midiParserCs = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+public class MidiNoteEvent
+{
+    public long StartMs { get; set; }
+    public long DurationMs { get; set; }
+    public int MidiNote { get; set; }
+}
+
+public static class MidiParser
+{
+    public static List<MidiNoteEvent> Parse(string filePath)
+    {
+        var notes = new List<MidiNoteEvent>();
+        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var br = new BinaryReader(fs))
+        {
+            var header = new string(br.ReadChars(4));
+            if (header != "MThd")
+                throw new Exception("Invalid MIDI header");
+            br.ReadBytes(4);
+            int format = ReadBigEndianShort(br);
+            int numTracks = ReadBigEndianShort(br);
+            int division = ReadBigEndianShort(br);
+            int ticksPerQuarter = (division & 0x7FFF);
+            double currentTempo = 500000.0;
+
+            var pendingNotes = new Dictionary<int, long>();
+
+            for (int trackIdx = 0; trackIdx < numTracks; trackIdx++)
+            {
+                var chunkId = new string(br.ReadChars(4));
+                if (chunkId != "MTrk")
+                    throw new Exception("Expected MTrk chunk");
+                int chunkLen = ReadBigEndianInt(br);
+                long chunkEnd = fs.Position + chunkLen;
+                byte runningStatus = 0;
+                long tick = 0;
+                double micros = 0;
+
+                while (fs.Position < chunkEnd)
+                {
+                    int delta = ReadVariableLength(br);
+                    tick += delta;
+                    micros += delta * (currentTempo / ticksPerQuarter);
+
+                    byte b = br.ReadByte();
+                    byte status;
+                    if ((b & 0x80) != 0)
+                    {
+                        status = b;
+                        runningStatus = b;
+                    }
+                    else
+                    {
+                        status = runningStatus;
+                        fs.Seek(-1, SeekOrigin.Current);
+                    }
+
+                    if (status >= 0xF0)
+                    {
+                        if (status == 0xFF)
+                        {
+                            byte metaType = br.ReadByte();
+                            int metaLen = ReadVariableLength(br);
+                            byte[] metaData = br.ReadBytes(metaLen);
+                            if (metaType == 0x51 && metaLen == 3)
+                            {
+                                int usPerQuarter = (metaData[0] << 16) | (metaData[1] << 8) | metaData[2];
+                                currentTempo = usPerQuarter;
+                            }
+                        }
+                        else if (status == 0xF0 || status == 0xF7)
+                        {
+                            int len = ReadVariableLength(br);
+                            br.ReadBytes(len);
+                        }
+                        continue;
+                    }
+
+                    int cmd = status & 0xF0;
+
+                    if (cmd == 0x80 || cmd == 0x90)
+                    {
+                        int note = br.ReadByte();
+                        int vel = br.ReadByte();
+                        bool isOff = (cmd == 0x80 || vel == 0);
+                        long startMicros = (long)micros;
+                        if (isOff && pendingNotes.ContainsKey(note))
+                        {
+                            long start = pendingNotes[note];
+                            pendingNotes.Remove(note);
+                            notes.Add(new MidiNoteEvent
+                            {
+                                StartMs = start / 1000,
+                                DurationMs = (startMicros - start) / 1000,
+                                MidiNote = note
+                            });
+                        }
+                        else if (!isOff)
+                        {
+                            pendingNotes[note] = startMicros;
+                        }
+                    }
+                    else if (cmd == 0xA0 || cmd == 0xB0 || cmd == 0xE0)
+                    {
+                        br.ReadByte();
+                        br.ReadByte();
+                    }
+                    else if (cmd == 0xC0 || cmd == 0xD0)
+                    {
+                        br.ReadByte();
+                    }
+                }
+            }
+        }
+        notes.Sort((a, b) => a.StartMs.CompareTo(b.StartMs));
+        return notes;
+    }
+
+    static int ReadBigEndianShort(BinaryReader br)
+    {
+        byte[] b = br.ReadBytes(2);
+        return (b[0] << 8) | b[1];
+    }
+
+    static int ReadBigEndianInt(BinaryReader br)
+    {
+        byte[] b = br.ReadBytes(4);
+        return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+    }
+
+    static int ReadVariableLength(BinaryReader br)
+    {
+        int v = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            byte b = br.ReadByte();
+            v = (v << 7) | (b & 0x7F);
+            if ((b & 0x80) == 0) break;
+        }
+        return v;
+    }
+}
+'@
+
+try {
+    Add-Type -TypeDefinition $midiParserCs -Language CSharp -ErrorAction Stop | Out-Null
+} catch {
+    Write-Host "C# MIDI Parser 编译失败：" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
     return
 }
 
@@ -82,12 +252,11 @@ $xaml = @"
         FontFamily="Consolas">
     <Grid Margin="10">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>   <!-- 标题 -->
-            <RowDefinition Height="Auto"/>   <!-- 测试按钮 -->
-            <RowDefinition Height="*"/>      <!-- 键盘 + 日志 -->
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <!-- 顶部标题 -->
         <Border Grid.Row="0" Margin="0,0,0,10" Padding="10"
                 Background="#111111"
                 CornerRadius="4">
@@ -106,7 +275,6 @@ $xaml = @"
             </TextBlock>
         </Border>
 
-        <!-- 测试按钮 -->
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
             <Button x:Name="TestButton"
                     Content="测试"
@@ -116,19 +284,34 @@ $xaml = @"
                     Background="#222222"
                     Foreground="Lime"
                     BorderBrush="Gray"/>
+            <Button x:Name="MidiOpenButton"
+                    Content="打开 MIDI"
+                    Width="100"
+                    Height="30"
+                    Margin="0,0,10,0"
+                    Background="#222222"
+                    Foreground="Cyan"
+                    BorderBrush="Gray"/>
+            <Button x:Name="MidiStopButton"
+                    Content="停止"
+                    Width="80"
+                    Height="30"
+                    Margin="0,0,10,0"
+                    Background="#222222"
+                    Foreground="Orange"
+                    BorderBrush="Gray"
+                    IsEnabled="False"/>
             <TextBlock Text="使用鼠标点击琴键或使用键盘zsxdcvgbhnjm,l.;/q2w3e4rt6y7ui9o0p-[]演奏，c3-c6。"
                        VerticalAlignment="Center"
                        Foreground="LightGray"/>
         </StackPanel>
 
-        <!-- 主体 -->
         <Grid Grid.Row="2">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="300"/>
             </Grid.ColumnDefinitions>
 
-            <!-- 钢琴键盘（横向滚动） -->
             <ScrollViewer x:Name="PianoScroll"
                           Grid.Column="0"
                           HorizontalScrollBarVisibility="Visible"
@@ -139,7 +322,6 @@ $xaml = @"
                         Background="Black"/>
             </ScrollViewer>
 
-            <!-- 日志窗口 -->
             <Border Grid.Column="1"
                     Margin="10,0,0,0"
                     Background="#111111"
@@ -162,14 +344,30 @@ $xaml = @"
 </Window>
 "@
 
-# 解析 XAML 并获取控件
 $xmlReader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
 $window    = [Windows.Markup.XamlReader]::Load($xmlReader)
 
-$pianoCanvas = $window.FindName('PianoCanvas')
-$logBox      = $window.FindName('LogBox')
-$testButton  = $window.FindName('TestButton')
-$pianoScroll = $window.FindName('PianoScroll')
+$pianoCanvas    = $window.FindName('PianoCanvas')
+$logBox         = $window.FindName('LogBox')
+$testButton     = $window.FindName('TestButton')
+$pianoScroll    = $window.FindName('PianoScroll')
+$midiOpenButton = $window.FindName('MidiOpenButton')
+$midiStopButton = $window.FindName('MidiStopButton')
+
+$script:midiStopRequested = $false
+$script:midiPlaybackJob   = $null
+$script:mainWindow       = $window
+$script:mainMidiStopBtn  = $midiStopButton
+$script:mainMidiOpenBtn  = $midiOpenButton
+$script:midiStopRequested = $false
+$script:midiPlaybackJob   = $null
+$script:mainWindow       = $window
+$script:mainMidiStopBtn  = $midiStopButton
+$script:mainMidiOpenBtn  = $midiOpenButton
+$script:midiNotes        = @()
+$script:midiPlayIndex    = 0
+$script:midiStartTick    = 0
+$script:midiPlayTimer    = $null
 
 # ============================
 # 日志函数
@@ -187,21 +385,16 @@ function Write-Log {
 # ============================
 # 键盘映射与音高计算
 # ============================
-
-# 你指定的键盘序列
 $keyCharsString = "zsxdcvgbhnjm,l.;/q2w3e4rt6y7ui9o0p-[]"
 $keyChars = $keyCharsString.ToCharArray() | Where-Object { $_ -ne [char]0 }
 
-# C3 的 MIDI 号：48；从 C3 开始连续映射
-$startMidi = 48  # C3
+$startMidi = 48
 $noteNames = "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
 
-# 存储：字符 -> 音符信息
-$script:keyMap      = @{} # char -> [pscustomobject]
-$script:keyButtons  = @{} # char -> Button
-$script:pressedKeys = @{} # char -> $true / $false
+$script:keyMap      = @{}
+$script:keyButtons  = @{}
+$script:pressedKeys = @{}
 
-# 键盘视觉参数
 $whiteKeyWidth  = 40
 $whiteKeyHeight = 180
 $blackKeyWidth  = 26
@@ -211,33 +404,27 @@ $whiteIndex = 0
 
 for ($i = 0; $i -lt $keyChars.Count; $i++) {
     $ch   = [string]$keyChars[$i]
-    $midi = $startMidi + $i      # 从 C3 连续上行
+    $midi = $startMidi + $i
     $index = $midi % 12
     $noteName = $noteNames[$index]
 
-    # MIDI 到八度：C4(60) -> 4
     $octave = [int][math]::Floor($midi / 12) - 1
 
-    # 计算频率（等音分，A4=440Hz）
     $n    = $midi - 69
     $freq = 440.0 * [math]::Pow(2.0, $n / 12.0)
 
-    # Beep 限制范围（37 - 32767）
     if ($freq -lt 37)    { $freq = 37 }
     if ($freq -gt 32767) { $freq = 32767 }
 
     $isBlack = $noteName.Contains("#")
 
-    # 确定在 Canvas 中的位置
     if (-not $isBlack) {
         $x = $whiteIndex * $whiteKeyWidth
         $whiteIndex++
     } else {
-        # 黑键位于当前白键与前一白键之间
         $x = $whiteIndex * $whiteKeyWidth - ($blackKeyWidth / 2.0)
     }
 
-    # 创建按键按钮：白键 / 黑键
     if (-not $isBlack) {
         $btn = New-Object System.Windows.Controls.Button
         $btn.Width       = $whiteKeyWidth
@@ -251,7 +438,6 @@ for ($i = 0; $i -lt $keyChars.Count; $i++) {
         $btn.VerticalContentAlignment   = 'Bottom'
         $btn.HorizontalContentAlignment = 'Center'
 
-        # 只在 C3~C6 上写字
         if ($noteName -eq "C" -and $octave -ge 3 -and $octave -le 6) {
             $btn.Content = "C$octave"
         } else {
@@ -277,13 +463,10 @@ for ($i = 0; $i -lt $keyChars.Count; $i++) {
         [System.Windows.Controls.Panel]::SetZIndex($btn, 1)
     }
 
-    # Tag 存储键字符
     $btn.Tag = $ch
 
-    # 加入 Canvas
     [void]$pianoCanvas.Children.Add($btn)
 
-    # 保存映射
     $info = [pscustomobject]@{
         Char      = $ch
         Midi      = $midi
@@ -296,13 +479,11 @@ for ($i = 0; $i -lt $keyChars.Count; $i++) {
     $script:keyButtons[$ch] = $btn
 }
 
-# 根据白键数量设置 Canvas 宽度，以便滚动
 $pianoCanvas.Width = $whiteIndex * $whiteKeyWidth
 
 # ============================
-# 键盘视觉动画函数
+# 键盘视觉动画
 # ============================
-
 function Get-KeyBaseBrush {
     param($info)
     if ($info.IsBlack) {
@@ -317,8 +498,6 @@ function Invoke-KeyVisualDown {
         [System.Windows.Controls.Button]$Button,
         $Info
     )
-
-    # 按下动画
     $Button.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Colors]::Gold)
     $Button.BorderBrush = [System.Windows.Media.Brushes]::Orange
 
@@ -336,7 +515,6 @@ function Invoke-KeyVisualUp {
         [System.Windows.Controls.Button]$Button,
         $Info
     )
-
     $Button.Background  = Get-KeyBaseBrush $Info
     $Button.BorderBrush = [System.Windows.Media.Brushes]::Gray
     $Button.Opacity     = 1.0
@@ -345,7 +523,6 @@ function Invoke-KeyVisualUp {
 # ============================
 # 音符触发逻辑
 # ============================
-
 function Invoke-NoteDown {
     param(
         [string]$Char
@@ -358,7 +535,6 @@ function Invoke-NoteDown {
     }
 
     if ($script:pressedKeys.ContainsKey($Char)) {
-        # 已经在按下状态，忽略重复
         return
     }
 
@@ -399,7 +575,6 @@ function Invoke-NoteUp {
         }
     }
 
-    # 停止持续 Beep，发送37hz 50ms Beep
     [Kernel32PlayerBeep]::StopNote($Char)
 
     if ($info) {
@@ -412,7 +587,6 @@ function Invoke-NoteUp {
 # ============================
 # 鼠标事件绑定
 # ============================
-
 foreach ($entry in $script:keyButtons.GetEnumerator()) {
     $btn  = $entry.Value
     $char = [string]$entry.Key
@@ -431,7 +605,6 @@ foreach ($entry in $script:keyButtons.GetEnumerator()) {
         $e.Handled = $true
     })
 
-    # 鼠标拖出键面时，若仍按下则视为松开
     $btn.Add_MouseLeave({
         param($sender, $e)
         $c = [string]$sender.Tag
@@ -444,32 +617,25 @@ foreach ($entry in $script:keyButtons.GetEnumerator()) {
 # ============================
 # 键盘事件绑定
 # ============================
-
 function Convert-KeyToChar {
     param(
         [System.Windows.Input.Key]$Key
     )
-
-    # 处理字母 A-Z
     if ($Key -ge [System.Windows.Input.Key]::A -and $Key -le [System.Windows.Input.Key]::Z) {
         $ch = $Key.ToString().ToLower()
         return $ch
     }
 
-    # 数字键 0-9（主键盘行）
     if ($Key -ge [System.Windows.Input.Key]::D0 -and $Key -le [System.Windows.Input.Key]::D9) {
         $num = [int]$Key - [int][System.Windows.Input.Key]::D0
         return "$num"
     }
 
     switch ($Key) {
-        # 顶部符号行
         ([System.Windows.Input.Key]::OemMinus)        { return "-" }
         ([System.Windows.Input.Key]::OemPlus)         { return "=" }
         ([System.Windows.Input.Key]::OemOpenBrackets) { return "[" }
         ([System.Windows.Input.Key]::OemCloseBrackets) { return "]" }
-
-        # 主键盘中下排
         ([System.Windows.Input.Key]::OemComma)        { return "," }
         ([System.Windows.Input.Key]::OemPeriod)       { return "." }
         ([System.Windows.Input.Key]::OemSemicolon)    { return ";" }
@@ -499,6 +665,117 @@ $window.Add_PreviewKeyUp({
 })
 
 # ============================
+# MIDI 播放
+# ============================
+function Start-MidiPlayback {
+    param([string]$FilePath)
+
+    $script:midiStopRequested = $false
+    try {
+        $script:midiNotes = [MidiParser]::Parse($FilePath)
+    } catch {
+        Write-Log "MIDI 解析失败: $($_.Exception.Message)"
+        return
+    }
+    if ($script:midiNotes.Count -eq 0) {
+        Write-Log "MIDI 文件中没有音符。"
+        return
+    }
+
+    $script:midiPlayIndex = 0
+    $script:midiStartTick = [Environment]::TickCount
+    $script:midiPendingStops = @{}
+
+    if ($script:midiPlayTimer) {
+        $script:midiPlayTimer.Stop()
+        $script:midiPlayTimer = $null
+    }
+
+    $script:midiPlayTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:midiPlayTimer.Interval = [TimeSpan]::FromMilliseconds(20)
+    $script:midiPlayTimer.Add_Tick({
+        $elapsed = [Environment]::TickCount - $script:midiStartTick
+
+        foreach ($k in @($script:midiPendingStops.Keys)) {
+            if ($script:midiPendingStops[$k] -le $elapsed) {
+                [Kernel32PlayerBeep]::StopNote($k)
+                $script:midiPendingStops.Remove($k)
+            }
+        }
+
+        while ($script:midiPlayIndex -lt $script:midiNotes.Count -and -not $script:midiStopRequested) {
+            $ev = $script:midiNotes[$script:midiPlayIndex]
+            if ($ev.StartMs -gt $elapsed) { break }
+            $freq = 440.0 * [math]::Pow(2.0, ($ev.MidiNote - 69) / 12.0)
+            if ($freq -lt 37)    { $freq = 37 }
+            if ($freq -gt 32767) { $freq = 32767 }
+            $durMs = [int][math]::Max(1, [math]::Min($ev.DurationMs, 60000))
+            $noteId = "midi_$($ev.MidiNote)_$($ev.StartMs)"
+            [Kernel32PlayerBeep]::StartNote($noteId, [uint32][math]::Round($freq))
+            $script:midiPendingStops[$noteId] = $ev.StartMs + $durMs
+            $script:midiPlayIndex++
+        }
+
+        if ($script:midiPlayIndex -ge $script:midiNotes.Count) {
+            $maxEnd = 0
+            foreach ($v in $script:midiPendingStops.Values) { if ($v -gt $maxEnd) { $maxEnd = $v } }
+            if ($elapsed -ge $maxEnd -or $script:midiPendingStops.Count -eq 0) {
+                $script:midiPlayTimer.Stop()
+                $script:midiPlayTimer = $null
+                $script:mainMidiStopBtn.IsEnabled = $false
+                $script:mainMidiOpenBtn.IsEnabled = $true
+                Write-Log "MIDI 播放结束。"
+            }
+        }
+        if ($script:midiStopRequested) {
+            foreach ($k in @($script:midiPendingStops.Keys)) {
+                [Kernel32PlayerBeep]::StopNote($k)
+            }
+            $script:midiPendingStops.Clear()
+            $script:midiPlayTimer.Stop()
+            $script:midiPlayTimer = $null
+            $script:mainMidiStopBtn.IsEnabled = $false
+            $script:mainMidiOpenBtn.IsEnabled = $true
+            Write-Log "MIDI 播放已停止。"
+        }
+    })
+    $script:midiPlayTimer.Start()
+}
+
+$midiOpenButton.Add_Click({
+    $dialog = New-Object Microsoft.Win32.OpenFileDialog
+    $dialog.Filter = "MIDI 文件 (*.mid;*.midi)|*.mid;*.midi|所有文件 (*.*)|*.*"
+    $dialog.Title = "选择 MIDI 文件"
+    $dialog.Multiselect = $false
+    $dialog.CheckFileExists = $true
+    $result = $dialog.ShowDialog($window)
+    if ($result -eq $true -and $dialog.FileName) {
+        $script:midiStopRequested = $false
+        $midiOpenButton.IsEnabled = $false
+        $midiStopButton.IsEnabled = $true
+        Write-Log "正在解析 MIDI: $($dialog.FileName)"
+        try {
+            $notes = [MidiParser]::Parse($dialog.FileName)
+            Write-Log "解析完成，共 $($notes.Count) 个音符，开始播放 (Kernel32 Beep)..."
+            Start-MidiPlayback -FilePath $dialog.FileName
+        } catch {
+            Write-Log "MIDI 解析失败: $($_.Exception.Message)"
+            $midiOpenButton.IsEnabled = $true
+            $midiStopButton.IsEnabled = $false
+        }
+    } else {
+        Write-Log "未选择文件。"
+    }
+})
+
+$midiStopButton.Add_Click({
+    $script:midiStopRequested = $true
+    $midiStopButton.IsEnabled = $false
+    $midiOpenButton.IsEnabled = $true
+    Write-Log "已请求停止 MIDI 播放。"
+})
+
+# ============================
 # 测试按钮
 # ============================
 $testButton.Add_Click({
@@ -507,9 +784,7 @@ $testButton.Add_Click({
     Write-Log "测试完成。"
 })
 
-# 初始日志
 Write-Log "Kernel32Player 已启动。"
 Write-Log "使用鼠标点击琴键或使用键盘zsxdcvgbhnjm,l.;/q2w3e4rt6y7ui9o0p-[]演奏，c3-c6。"
 
-# 显示窗口（禁止最大化：XAML 中已设置 ResizeMode="CanMinimize"）
 $null = $window.ShowDialog()
